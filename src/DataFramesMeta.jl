@@ -71,10 +71,11 @@ end
 function with_helper2(body)
     membernames = Dict{Any, Symbol}()
     body = replace_syms!(body, membernames)
-    @show membernames
 
     if isempty(membernames)
-        (), body
+        quote
+            (Symbol[], $body)
+        end
     else
         quote
         ($([x.args[1] for x in keys(membernames)]),
@@ -391,12 +392,12 @@ end
 function transform(d::Union{AbstractDataFrame, AbstractDict}; kwargs...)
     result = copy(d)
     for (k, v) in kwargs
-        result[k] = isa(v, Function) ? v(d) : v
+        colnames = v[1]
+        f = v[2]
+        result[k] = isa(f, Function) ? f((d[x] for x in colnames)...) : f
     end
     return result
 end
-
-argnames(f::Function) = Symbol.(getindex.(Base.arg_decl_parts(methods(f).ms[1])[2][2:end], 1))
 
 function transform(g::GroupedDataFrame; kwargs...)
     result = DataFrame(g)
@@ -453,7 +454,7 @@ function _transform!(t::AbstractVector, first::AbstractVector, start::Int,
         if newtype !== nothing
              t = copyto!(Tables.allocatecolumn(newtype, length(t)),
                          1, t, 1, ends[i-1])
-             _transform!(t, out, i, g, v, starts, ends)
+             _transform!(t, out, i, g, cols, v, starts, ends)
          end
     end
     return t
@@ -485,7 +486,7 @@ function _transform!(t::AbstractVector, first::Any, start::Int,
         if newtype !== nothing
              t = copyto!(Tables.allocatecolumn(newtype, length(t)),
                          1, t, 1, ends[i-1])
-             _transform!(t, out, i, g, v, starts, ends)
+             _transform!(t, out, i, g, cols, v, starts, ends)
          end
     end
     return t

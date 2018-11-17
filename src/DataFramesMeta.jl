@@ -15,13 +15,6 @@ include("byrow.jl")
 ##
 ##############################################################################
 
-function addkey!(membernames, nam)
-    if !haskey(membernames, nam)
-        membernames[nam] = gensym()
-    end
-    membernames[nam]
-end
-
 onearg(e, f) = e.head == :call && length(e.args) == 2 && e.args[1] == f
 mapexpr(f, e) = Expr(e.head, map(f, e.args)...)
 
@@ -33,11 +26,11 @@ replace_syms!(e::Expr, membernames) =
         e.args[2]
     elseif onearg(e, :_I_)
         @warn "_I_() for escaping variables is deprecated, use cols() instead"
-        addkey!(membernames, :($(e.args[2])))
+        get!(membernames, :($(e.args[2]))) do; gensym(); end
     elseif onearg(e, :cols)
-        addkey!(membernames, :($(e.args[2])))
+        get!(membernames, :($(e.args[2]))) do; gensym(); end
     elseif e.head == :quote
-        addkey!(membernames, Meta.quot(e.args[1]) )
+        get!(membernames, Meta.quot(e.args[1])) do; gensym(); end
     elseif e.head == :.
         replace_dotted!(e, membernames)
     else
@@ -71,6 +64,23 @@ function with_helper(d, body)
                 $body
             end
             $funname($((:($d[$key]) for key in keys(membernames))...))
+        end
+    end
+end
+
+function with_helper2(body)
+    membernames = Dict{Any, Symbol}()
+    body = replace_syms!(body, membernames)
+    @show membernames
+
+    if isempty(membernames)
+        (), body
+    else
+        quote
+        ($([x.args[1] for x in keys(membernames)]),
+             ($(values(membernames)...),) -> begin
+                 $body
+             end)
         end
     end
 end
@@ -386,19 +396,25 @@ function transform(d::Union{AbstractDataFrame, AbstractDict}; kwargs...)
     return result
 end
 
+argnames(f::Function) = Symbol.(getindex.(Base.arg_decl_parts(methods(f).ms[1])[2][2:end], 1))
+
 function transform(g::GroupedDataFrame; kwargs...)
     result = DataFrame(g)
     ends = cumsum(Int[size(g[i],1) for i in 1:length(g)])
     starts = [1; 1 .+ ends[1:end-1]]
     lengths = [ends[i] - starts[i] + 1 for i in 1:length(starts)]
     for (k, v) in kwargs
-        first = v(g[1])
+        colnames = v[1]
+        f = v[2]
+        cols = Tuple(columns(g.parent[colnames]))
+        idx = g.idx[g.starts[1]:g.ends[1]]
+        first = f(map(c -> view(c, idx), cols)...)
         if first isa AbstractVector
             t = _transform!(Tables.allocatecolumn(eltype(first), size(result, 1)),
-                            first, 1, g, v, starts, ends)
+                            first, 1, g, cols, f, starts, ends)
         else
             t = _transform!(Tables.allocatecolumn(typeof(first), size(result, 1)),
-                            first, 1, g, v, starts, ends)
+                            first, 1, g, cols, f, starts, ends)
         end
         result[k] = t
     end
@@ -406,9 +422,9 @@ function transform(g::GroupedDataFrame; kwargs...)
 end
 
 function _transform!(t::AbstractVector, first::AbstractVector, start::Int,
-                     g::GroupedDataFrame, v::Function, starts::Vector, ends::Vector)
+                     g::GroupedDataFrame, cols::Tuple, v::Function, starts::Vector, ends::Vector)
     @inline function fill_column!(t::AbstractVector, out, startpoint::Int, endpoint::Int,
-                                      len::Int)
+                                  len::Int)
         if !(out isa AbstractVector)
             throw(ArgumentError("Return value must be an `AbstractVector` for all groups or" *
                                 "for none of them"))
@@ -431,7 +447,8 @@ function _transform!(t::AbstractVector, first::AbstractVector, start::Int,
     newtype_first = fill_column!(t, first, starts[start], ends[start], size(g[start], 1))
     @assert newtype_first === nothing
     @inbounds for i in (start+1):length(g)
-        out = v(g[i])
+        idx = g.idx[g.starts[i]:g.ends[i]]
+        out = v(map(c -> view(c, idx), cols)...)
         newtype = fill_column!(t, out, starts[i], ends[i], size(g[i], 1))
         if newtype !== nothing
              t = copyto!(Tables.allocatecolumn(newtype, length(t)),
@@ -443,7 +460,7 @@ function _transform!(t::AbstractVector, first::AbstractVector, start::Int,
 end
 
 function _transform!(t::AbstractVector, first::Any, start::Int,
-                     g::GroupedDataFrame, v::Function, starts::Vector, ends::Vector)
+                     g::GroupedDataFrame, cols::Tuple, v::Function, starts::Vector, ends::Vector)
     @inline function fill_column!(t::AbstractVector, out, startpoint::Int, endpoint::Int)
         if out isa AbstractVector
             throw(ArgumentError("Return value must be an `AbstractVector` for all groups or" *
@@ -462,7 +479,8 @@ function _transform!(t::AbstractVector, first::Any, start::Int,
     newtype_first = fill_column!(t, first, starts[start], ends[start])
     @assert newtype_first === nothing
     @inbounds for i in (start+1):length(g)
-        out = v(g[i])
+        idx = g.idx[g.starts[i]:g.ends[i]]
+        out = v(map(c -> view(c, idx), cols)...)
         newtype = fill_column!(t, out, starts[i], ends[i])
         if newtype !== nothing
              t = copyto!(Tables.allocatecolumn(newtype, length(t)),
@@ -476,7 +494,7 @@ end
 function transform_helper(x, args...)
     quote
         $transform($x, $(map(args) do kw
-            Expr(:kw, kw.args[1], with_anonymous(kw.args[2]))
+            Expr(:kw, kw.args[1], with_helper2(kw.args[2]))
         end...) )
     end
 end

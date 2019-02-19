@@ -68,13 +68,36 @@ function with_helper(d, body)
     end
 end
 
+"""Check whether expression is a single-argument call, like f(x)"""
+isoneargcall(e::Expr) =
+    e.head === :call && length(e.args) == 2 && e.args[1] isa Symbol
+
+function tocomposition(body)
+    if body.head == :(=) && length(body.args) == 2 &&
+        body.args[2] isa Expr
+        funs = Symbol[]
+        e = body.args[2]
+        while e isa Expr && isoneargcall(e)
+            push!(funs, e.args[1])
+            e = e.args[2]
+        end
+        if e isa Symbol || (e isa QuoteNode && e.value isa Symbol)
+            # Recursion parsed the full expression
+            return mapreduce(eval, ∘, funs)
+        else # Expression doesn't consist only in single-argument calls
+            return body
+        end
+    end
+    return body
+end
+
 function with_helper2(body)
     membernames = Dict{Any, Symbol}()
     body = replace_syms!(body, membernames)
 
     if isempty(membernames)
         quote
-            (Symbol[], $body)
+            (Symbol[] => () -> $body)
         end
     else
         quote
@@ -392,24 +415,29 @@ end
 function transform(d::Union{AbstractDataFrame, AbstractDict}; kwargs...)
     result = copy(d)
     for (k, v) in kwargs
-        colnames = v[1]
-        f = v[2]
-        result[k] = isa(f, Function) ? f((d[x] for x in colnames)...) : f
+        result[k] = isa(v, Function) ? v(d) : v
     end
     return result
 end
 
-transform(g::GroupedDataFrame; kwargs...) = combine(g; kwargs...)
+function transform(g::GroupedDataFrame; args...)
+    res = combine(values(args), g)
+    if nrow(res) == nrow(parent(g))
+        return res
+    else
+        return res[g.rperm, :] # FIXME
+    end
+end
 
 function transform_helper(x, args...)
     quote
-        if $x isa GroupedDataFrame
+        if $x isa $GroupedDataFrame
             $transform($x, $(map(args) do kw
                 Expr(:kw, kw.args[1], with_helper2(kw.args[2]))
             end...) )
         else
             $transform($x, $(map(args) do kw
-                Expr(:kw, kw.args[1], with_helper(kw.args[2]))
+                Expr(:kw, kw.args[1], with_anonymous(kw.args[2]))
             end...) )
         end
     end
